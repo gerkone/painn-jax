@@ -1,0 +1,8 @@
+venv
+__pycache__
+n_body_system
+*.npy
+.vscode
+qm9tut
+qm9.db
+splitting.lock
