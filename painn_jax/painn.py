@@ -5,7 +5,7 @@ import jax.numpy as jnp
 import jax.tree_util as tree
 import jraph
 
-from .blocks import GatedEquivariantBlock, scaled_silu
+from .blocks import GatedEquivariantBlock, pooling, scaled_silu
 
 
 class NodeFeatures(NamedTuple):
@@ -17,26 +17,50 @@ class NodeFeatures(NamedTuple):
 
 def PaiNNReadout(
     hidden_size: int,
+    task: str,
+    pool: str,
     output_channels: int = 1,
     activation: Callable = scaled_silu,
     blocks: int = 2,
 ) -> Callable:
-    """PaiNN readout block."""
+    """
+    PaiNN readout block.
 
-    def _readout(s: jnp.ndarray, v: jnp.ndarray) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    Args:
+        hidden_size: Number of hidden channels.
+        task: Task to perform. Either "node" or "graph".
+        pool: pool method. Either "sum" or "avg".
+        output_channels: Number of output channels.
+        activation: Activation function.
+        blocks: Number of readout blocks.
+    """
+
+    assert task in ["node", "graph"], "task must be node or graph"
+    assert pool in ["sum", "avg"], "pool must be sum or avg"
+    if pool == "avg":
+        pool_fn = jraph.segment_mean
+    if pool == "sum":
+        pool_fn = jraph.segment_sum
+
+    def _readout(graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        s, v = graph.nodes
         for i in range(blocks - 1):
             s, v = GatedEquivariantBlock(
                 hidden_channels=hidden_size,
-                output_channels=output_channels,
+                output_channels=hidden_size,
                 activation=activation,
                 name=f"readout_block_{i}",
             )(s, v)
+
+        if task == "graph":
+            graph = graph._replace(nodes=NodeFeatures(s, v))
+            s, v = pooling(graph, aggregate_fn=pool_fn)
 
         s, v = GatedEquivariantBlock(
             hidden_channels=hidden_size,
             output_channels=output_channels,
             activation=activation,
-            name=f"readout_block_{i}",
+            name="readout_block_out",
         )(s, v)
 
         return s, v
@@ -202,6 +226,8 @@ class PaiNN(hk.Module):
         n_rbf: int = 20,
         activation: Callable = scaled_silu,
         readout: bool = False,
+        task: str = "node",
+        pool: str = "sum",
         output_channels: Optional[int] = None,
         max_z: int = 100,
         shared_interactions: bool = False,
@@ -220,6 +246,8 @@ class PaiNN(hk.Module):
             n_rbf: Number of radial basis functions.
             activation: Activation function.
             readout: If True, use a readout layer. If False, returns representations.
+            task: Regression task to perform. Either "node"-wise or "graph"-wise.
+            pool: Node readout pool method. Only used in "graph" tasks.
             output_channels: Number of output scalar/vector channels. Used in readout.
             max_z: Maximum atomic number. Used in discrete node feature embedding.
             shared_interactions: If True, share the weights across interaction blocks.
@@ -272,7 +300,11 @@ class PaiNN(hk.Module):
         self.readout = None
         if readout:
             self.readout = PaiNNReadout(
-                hidden_size, output_channels=output_channels, activation=activation
+                hidden_size,
+                task,
+                pool,
+                output_channels=output_channels,
+                activation=activation,
             )
 
     def _embed(self, graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -291,7 +323,7 @@ class PaiNN(hk.Module):
         s = self.scalar_embedding(s)[:, jnp.newaxis, :]
         v = self.vector_embedding(v)
 
-        return s, v
+        return graph._replace(nodes=graph.nodes._replace(s=s, v=v))
 
     def __call__(self, graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
@@ -307,7 +339,7 @@ class PaiNN(hk.Module):
         """
         # compute atom and pair features
         norm_ij = jnp.linalg.norm(graph.edges, axis=1, keepdims=True)
-        # TODO this only works for displacement vectors as edges/r_ij
+        # TODO this only makes sense for displacement vectors as edges/r_ij
         dir_ij = graph.edges / norm_ij
         phi_ij = self.radial_basis_fn(norm_ij)
         # replace edges with normalized directions
@@ -323,8 +355,7 @@ class PaiNN(hk.Module):
         else:
             filter_list = jnp.split(filters, self._n_layers, axis=-1)
 
-        s, v = self._embed(graph)
-        graph = graph._replace(nodes=graph.nodes._replace(s=s, v=v))
+        graph = self._embed(graph)
 
         # message passing
         for n, layer in enumerate(self.layers):
@@ -332,5 +363,5 @@ class PaiNN(hk.Module):
 
         # readout
         if self.readout is not None:
-            s, v = self.readout(s, v)
-        return s, v
+            s, v = self.readout(graph)
+        return jnp.squeeze(s), jnp.squeeze(v)

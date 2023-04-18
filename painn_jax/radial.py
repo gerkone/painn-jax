@@ -19,11 +19,12 @@ def gaussian_rbf(
         start: center of first Gaussian function, :math:`\mu_0`.
         trainable: If True, widths and offset of Gaussian functions learnable.
     """
-    # compute offset and width of Gaussian functions
-    offset = jnp.linspace(start, cutoff, n_rbf)
-    width = jnp.zeros_like(offset)
-    if not centered:
-        width = jnp.array(jnp.abs(offset[1] - offset[0]) * offset)
+    if centered:
+        widths = jnp.linspace(start, cutoff, n_rbf)
+        offset = jnp.zeros_like(widths)
+    else:
+        offset = jnp.linspace(start, cutoff, n_rbf)
+        width = jnp.abs(cutoff - start) / n_rbf * jnp.ones_like(offset)
 
     if trainable:
         widths = hk.get_parameter("widths", width.shape, width.dtype, init=width)
@@ -34,9 +35,9 @@ def gaussian_rbf(
         widths = hk.get_state("widths")
         offsets = hk.get_state("offsets")
 
-    def _rbf(inputs: jnp.ndarray) -> jnp.ndarray:
+    def _rbf(x: jnp.ndarray) -> jnp.ndarray:
         coeff = -0.5 / jnp.power(widths, 2)
-        diff = inputs[..., jnp.newaxis] - offsets
+        diff = x[..., jnp.newaxis] - offsets
         return jnp.exp(coeff * jnp.power(diff, 2))
 
     return _rbf
@@ -59,10 +60,10 @@ def bessel_rbf(n_rbf: int, cutoff: float) -> Callable[[jnp.ndarray], Callable]:
     hk.set_state("freqs", freqs)
     freqs = hk.get_state("freqs")
 
-    def _rbf(self, inputs):
-        ax = inputs[..., None] * self.freqs
+    def _rbf(self, x: jnp.ndarray) -> jnp.ndarray:
+        ax = x[..., None] * self.freqs
         sinax = jnp.sin(ax)
-        norm = jnp.where(inputs == 0, 1.0, inputs)
+        norm = jnp.where(x == 0, 1.0, x)
         y = sinax / norm[..., None]
         return y
 

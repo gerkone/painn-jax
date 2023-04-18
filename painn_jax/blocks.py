@@ -1,7 +1,10 @@
 from typing import Callable, Tuple
+
+import haiku as hk
 import jax
 import jax.numpy as jnp
-import haiku as hk
+import jax.tree_util as tree
+import jraph
 
 
 def scaled_silu(x: jnp.ndarray) -> jnp.ndarray:
@@ -29,7 +32,6 @@ class GatedEquivariantBlock(hk.Module):
         activation: Callable = scaled_silu,
     ):
         super().__init__(name)
-        self._output_channels = output_channels
 
         self.vec1_proj = hk.Linear(hidden_channels, with_bias=False, name="vec1_proj")
         self.vec2_proj = hk.Linear(output_channels, with_bias=False, name="vec2_proj")
@@ -46,14 +48,39 @@ class GatedEquivariantBlock(hk.Module):
         self.act = activation
 
     def __call__(
-        self, x: jnp.ndarray, v: jnp.ndarray
+        self, s: jnp.ndarray, v: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        vec1 = jnp.linalg.norm(self.vec1_proj(v), axis=-2)
+        vec1 = jnp.reshape(jnp.linalg.norm(self.vec1_proj(v), axis=-2), s.shape)
         vec2 = self.vec2_proj(v)
 
-        x = jnp.concatenate([x, vec1], axis=-1)
-        x, v = jnp.split(self.update_net(x), self._output_channels, axis=-1)
-        v = v[..., jnp.newaxis] * vec2
-        x = self.act(x)
+        s = jnp.concatenate([s, vec1], axis=-1)
+        a = self.update_net(s)
+        s, v = jnp.split(a, 2, axis=-1)
+        v = v * vec2
+        s = self.act(s)
 
-        return x, v
+        return s, v
+
+
+def pooling(
+    graph: jraph.GraphsTuple,
+    aggregate_fn: Callable = jraph.segment_sum,
+) -> Tuple[jnp.ndarray, jnp.ndarray]:
+    """Pools over graph nodes with the specified aggregation.
+
+    Args:
+        graph: Input graph
+        aggregate_fn: function used to update pool over the nodes
+
+    Returns:
+        The pooled graph nodes.
+    """
+    n_graphs = graph.n_node.shape[0]
+    graph_idx = jnp.arange(n_graphs)
+    # Equivalent to jnp.sum(n_node), but jittable
+    sum_n_node = tree.tree_leaves(graph.nodes)[0].shape[0]
+    batch = jnp.repeat(graph_idx, graph.n_node, axis=0, total_repeat_length=sum_n_node)
+    s = aggregate_fn(graph.nodes.s, batch, n_graphs)
+    v = aggregate_fn(graph.nodes.v, batch, n_graphs)
+
+    return s, v
