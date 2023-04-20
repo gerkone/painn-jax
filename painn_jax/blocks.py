@@ -1,4 +1,4 @@
-from typing import Callable, Tuple
+from typing import Callable, Optional, Tuple
 
 import haiku as hk
 import jax
@@ -7,12 +7,22 @@ import jax.tree_util as tree
 import jraph
 
 
-def scaled_silu(x: jnp.ndarray) -> jnp.ndarray:
-    return jax.nn.silu(x) * 1 / 0.6
+class LinearXav(hk.Linear):
+    """Linear layer with Xavier init. Avoid distracting 'w_init' everywhere."""
+
+    def __init__(
+        self,
+        output_size: int,
+        with_bias: bool = True,
+        w_init: Optional[hk.initializers.Initializer] = None,
+        b_init: Optional[hk.initializers.Initializer] = None,
+        name: Optional[str] = None,
+    ):
+        if w_init is None:
+            w_init = hk.initializers.VarianceScaling(1.0, "fan_avg", "uniform")
+        super().__init__(output_size, with_bias, w_init, b_init, name)
 
 
-# borrowed from OCP PaiNN
-# https://github.com/Open-Catalyst-Project/ocp/blob/main/ocpmodels/models/painn/painn.py
 class GatedEquivariantBlock(hk.Module):
     """Gated equivariant block (restricted to L=1, vectorial features).
 
@@ -23,43 +33,56 @@ class GatedEquivariantBlock(hk.Module):
         ICML 2021
     """
 
-    # TODO is it useful to have a different number of scalar and vector channels?
     def __init__(
         self,
-        hidden_channels: int,
-        output_channels: int,
+        hidden_size: int,
+        scalar_out_channels: int,
+        vector_out_channels: int,
+        activation: Callable = jax.nn.silu,
+        scalar_activation: Callable = None,
+        eps: float = 1e-8,
         name: str = "gated_equivariant_block",
-        activation: Callable = scaled_silu,
     ):
         super().__init__(name)
 
-        self.vec1_proj = hk.Linear(hidden_channels, with_bias=False, name="vec1_proj")
-        self.vec2_proj = hk.Linear(output_channels, with_bias=False, name="vec2_proj")
+        # TODO support out channels = 0
+        self._scalar_out_channels = scalar_out_channels
+        self._vector_out_channels = vector_out_channels
+        self._eps = eps
 
-        self.update_net = hk.Sequential(
-            [
-                hk.Linear(hidden_channels, with_bias=False),
-                activation,
-                hk.Linear(output_channels * 2, with_bias=False),
-            ],
-            name="scalar_update_net",
+        self.vector_mix_net = LinearXav(
+            2 * vector_out_channels,
+            with_bias=False,
+            name="vector_mix_net",
         )
-
-        self.act = activation
+        self.gate_block = hk.Sequential(
+            [
+                LinearXav(hidden_size),
+                activation,
+                LinearXav(scalar_out_channels + vector_out_channels),
+            ],
+            name="scalar_gate_net",
+        )
+        self.scalar_activation = scalar_activation
 
     def __call__(
         self, s: jnp.ndarray, v: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        vec1 = jnp.reshape(jnp.linalg.norm(self.vec1_proj(v), axis=-2), s.shape)
-        vec2 = self.vec2_proj(v)
+        v_l, v_r = jnp.split(self.vector_mix_net(v), 2, axis=-1)
 
-        s = jnp.concatenate([s, vec1], axis=-1)
-        a = self.update_net(s)
-        s, v = jnp.split(a, 2, axis=-1)
-        v = v * vec2
-        s = self.act(s)
+        v_l_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2) + self._eps)
+        gating_scalars = jnp.concatenate([s, v_l_norm], axis=-1)
+        s_out, _, x = jnp.split(
+            self.gate_block(gating_scalars),
+            [self._scalar_out_channels, self._vector_out_channels],
+            axis=-1,
+        )
+        v_out = x[:, jnp.newaxis] * v_r
 
-        return s, v
+        if self.scalar_activation:
+            s_out = self.scalar_activation(s_out)
+
+        return s_out, v_out
 
 
 def pooling(
@@ -80,7 +103,11 @@ def pooling(
     # Equivalent to jnp.sum(n_node), but jittable
     sum_n_node = tree.tree_leaves(graph.nodes)[0].shape[0]
     batch = jnp.repeat(graph_idx, graph.n_node, axis=0, total_repeat_length=sum_n_node)
-    s = aggregate_fn(graph.nodes.s, batch, n_graphs)
-    v = aggregate_fn(graph.nodes.v, batch, n_graphs)
+
+    s, v = None, None
+    if graph.nodes.s is not None:
+        s = aggregate_fn(graph.nodes.s, batch, n_graphs)
+    if graph.nodes.v is not None:
+        v = aggregate_fn(graph.nodes.v, batch, n_graphs)
 
     return s, v

@@ -1,27 +1,29 @@
 from typing import Callable, NamedTuple, Optional, Tuple
 
 import haiku as hk
+import jax
 import jax.numpy as jnp
 import jax.tree_util as tree
 import jraph
 
-from .blocks import GatedEquivariantBlock, pooling, scaled_silu
+from .blocks import GatedEquivariantBlock, LinearXav, pooling
 
 
 class NodeFeatures(NamedTuple):
     """Simple container for scalar and vectorial node features."""
 
-    s: jnp.ndarray
-    v: jnp.ndarray
+    s: jnp.ndarray = None
+    v: jnp.ndarray = None
 
 
 def PaiNNReadout(
     hidden_size: int,
     task: str,
     pool: str,
-    output_channels: int = 1,
-    activation: Callable = scaled_silu,
+    out_channels: int = 1,
+    activation: Callable = jax.nn.silu,
     blocks: int = 2,
+    eps: float = 1e-8,
 ) -> Callable:
     """
     PaiNN readout block.
@@ -30,7 +32,7 @@ def PaiNNReadout(
         hidden_size: Number of hidden channels.
         task: Task to perform. Either "node" or "graph".
         pool: pool method. Either "sum" or "avg".
-        output_channels: Number of output channels.
+        scalar_out_channels: Number of scalar/vector output channels.
         activation: Activation function.
         blocks: Number of readout blocks.
     """
@@ -44,11 +46,15 @@ def PaiNNReadout(
 
     def _readout(graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
         s, v = graph.nodes
+        s = jnp.squeeze(s)
         for i in range(blocks - 1):
+            ith_hidden_size = hidden_size // 2**i
             s, v = GatedEquivariantBlock(
-                hidden_channels=hidden_size,
-                output_channels=hidden_size,
+                hidden_size=ith_hidden_size,
+                scalar_out_channels=ith_hidden_size // 2,
+                vector_out_channels=ith_hidden_size // 2,
                 activation=activation,
+                eps=eps,
                 name=f"readout_block_{i}",
             )(s, v)
 
@@ -57,9 +63,11 @@ def PaiNNReadout(
             s, v = pooling(graph, aggregate_fn=pool_fn)
 
         s, v = GatedEquivariantBlock(
-            hidden_channels=hidden_size,
-            output_channels=output_channels,
+            hidden_size=out_channels * 2,
+            scalar_out_channels=out_channels,
+            vector_out_channels=out_channels,
             activation=activation,
+            eps=eps,
             name="readout_block_out",
         )(s, v)
 
@@ -98,21 +106,23 @@ class PaiNNLayer(hk.Module):
 
         # inter-particle context net
         self.interaction_block = hk.Sequential(
-            [hk.Linear(hidden_size), activation] * (blocks - 1)
-            + [hk.Linear(3 * hidden_size)],
+            [LinearXav(hidden_size), activation] * (blocks - 1)
+            + [LinearXav(3 * hidden_size)],
             name="interaction_block",
         )
 
         # intra-particle context net
         self.mixing_block = hk.Sequential(
-            [hk.Linear(hidden_size), activation] * (blocks - 1)
-            + [hk.Linear(3 * hidden_size)],
+            [LinearXav(hidden_size), activation] * (blocks - 1)
+            + [LinearXav(3 * hidden_size)],
             name="mixing_block",
         )
 
         # vector channel mix
-        self.vector_mixing_block = hk.Linear(
-            2 * hidden_size, name="vector_mixing_block"
+        self.vector_mixing_block = LinearXav(
+            2 * hidden_size,
+            with_bias=False,
+            name="vector_mixing_block",
         )
 
     def _message(
@@ -144,16 +154,13 @@ class PaiNNLayer(hk.Module):
         vj = v[receivers]
 
         ds, dv1, dv2 = jnp.split(Wij * xj, 3, axis=-1)
-        # ds = tree.tree_map(
-        #     lambda s_: self._aggregate_fn(s_, senders, n_nodes), ds
-        # )
         n_nodes = tree.tree_leaves(s)[0].shape[0]
         ds = self._aggregate_fn(ds, senders, n_nodes)
-        dv = dv1 * dir_ij[..., jnp.newaxis] + dv2 * vj
+        dv = dv1[:, jnp.newaxis] * dir_ij[..., jnp.newaxis] + dv2[:, jnp.newaxis] * vj
         dv = self._aggregate_fn(dv, senders, n_nodes)
 
-        s = s + ds
-        v = v + dv
+        s = s + jnp.clip(ds, -1e4, 1e4)
+        v = v + jnp.clip(dv, -1e4, 1e4)
 
         return s, v
 
@@ -171,15 +178,15 @@ class PaiNNLayer(hk.Module):
         """
         ## intra-atomic
         v_l, v_r = jnp.split(self.vector_mixing_block(v), 2, axis=-1)
-        v_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2, keepdims=True) + self._eps)
+        v_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2) + self._eps)
 
         ts = jnp.concatenate([s, v_norm], axis=-1)
         ds, dv, dsv = jnp.split(self.mixing_block(ts), 3, axis=-1)
-        dv = dv * v_r
-        dsv = dsv * jnp.sum(v_l * v_r, axis=1, keepdims=True)
+        dv = dv[:, jnp.newaxis] * v_r
+        dsv = dsv * jnp.sum(v_l * v_r, axis=1)
 
-        s = s + ds + dsv
-        v = v + dv
+        s = s + jnp.clip(ds + dsv, -1e4, 1e4)
+        v = v + jnp.clip(dv, -1e4, 1e4)
         return s, v
 
     def __call__(
@@ -198,11 +205,9 @@ class PaiNNLayer(hk.Module):
         """
         # TODO make this work with jraph GNN functions
         s, v = graph.nodes
-        dir_ij = graph.edges
-        s, v = self._message(s, v, dir_ij, Wij, graph.senders, graph.receivers)
+        s, v = self._message(s, v, graph.edges, Wij, graph.senders, graph.receivers)
         s, v = self._update(s, v)
-        graph = graph._replace(nodes=graph.nodes._replace(s=s, v=v))
-        return graph
+        return graph._replace(nodes=NodeFeatures(s=s, v=v))
 
 
 class PaiNN(hk.Module):
@@ -220,15 +225,14 @@ class PaiNN(hk.Module):
         hidden_size: int,
         n_layers: int,
         radial_basis_fn: Callable,
-        node_type: str = "discrete",
         cutoff_fn: Optional[Callable] = None,
         radius: float = 5.0,
         n_rbf: int = 20,
-        activation: Callable = scaled_silu,
-        readout: bool = False,
+        activation: Callable = jax.nn.silu,
+        node_type: str = "discrete",
         task: str = "node",
-        pool: str = "sum",
-        output_channels: Optional[int] = None,
+        pool: str = "avg",
+        out_channels: Optional[int] = None,
         max_z: int = 100,
         shared_interactions: bool = False,
         shared_filters: bool = False,
@@ -240,15 +244,14 @@ class PaiNN(hk.Module):
             hidden_size: Determines the size of each embedding vector.
             n_layers: Number of interaction blocks.
             radial_basis_fn: Expands inter-particle distances in a basis set.
-            node_type: Type of node features. Either "discrete" or "continuous".
             cutoff_fn: Cutoff method. None means no cutoff.
             radius: Cutoff radius.
             n_rbf: Number of radial basis functions.
             activation: Activation function.
-            readout: If True, use a readout layer. If False, returns representations.
+            node_type: Type of node features. Either "discrete" or "continuous".
             task: Regression task to perform. Either "node"-wise or "graph"-wise.
             pool: Node readout pool method. Only used in "graph" tasks.
-            output_channels: Number of output scalar/vector channels. Used in readout.
+            out_channels: Number of output scalar/vector channels. Used in readout.
             max_z: Maximum atomic number. Used in discrete node feature embedding.
             shared_interactions: If True, share the weights across interaction blocks.
             shared_filters: If True, share the weights across filter networks.
@@ -260,13 +263,13 @@ class PaiNN(hk.Module):
             "discrete",
             "continuous",
         ], "node_type must be discrete or continuous"
-        assert (
-            output_channels is not None or not readout
-        ), "output_channels must be specified if readout is True"
+        assert task in ["node", "graph"], "task must be node or graph"
+        assert radial_basis_fn is not None, "A radial_basis_fn must be provided"
 
         self._hidden_size = hidden_size
         self._n_layers = n_layers
         self._eps = eps
+        self._node_type = node_type
         self._shared_filters = shared_filters
         self._shared_interactions = shared_interactions
 
@@ -274,18 +277,23 @@ class PaiNN(hk.Module):
         self.radial_basis_fn = radial_basis_fn(n_rbf, radius)
 
         if node_type == "discrete":
-            self.scalar_embedding = hk.Embed(
-                max_z, hidden_size, name="scalar_embedding"
+            self.scalar_emb = hk.Embed(
+                max_z,
+                hidden_size,
+                w_init=hk.initializers.VarianceScaling(1.0, "fan_avg", "uniform"),
+                name="scalar_embedding",
             )
         else:
-            self.scalar_embedding = hk.Linear(hidden_size, name="scalar_embedding")
-        # mix vector channels
-        self.vector_embedding = hk.Linear(hidden_size, name="vector_embedding")
+            self.scalar_emb = LinearXav(hidden_size, name="scalar_embedding")
+        # mix vector channels (only used if vector features are present in input)
+        self.vector_emb = LinearXav(
+            hidden_size, with_bias=False, name="vector_embedding"
+        )
 
         if shared_filters:
-            self.filter_net = hk.Linear(3 * hidden_size, name="filter_net")
+            self.filter_net = LinearXav(3 * hidden_size, name="filter_net")
         else:
-            self.filter_net = hk.Linear(n_layers * 3 * hidden_size, name="filter_net")
+            self.filter_net = LinearXav(n_layers * 3 * hidden_size, name="filter_net")
 
         if self._shared_interactions:
             self.layers = [
@@ -298,32 +306,39 @@ class PaiNN(hk.Module):
             ]
 
         self.readout = None
-        if readout:
+        if out_channels is not None:
             self.readout = PaiNNReadout(
                 hidden_size,
                 task,
                 pool,
-                output_channels=output_channels,
+                out_channels=out_channels,
                 activation=activation,
+                eps=eps,
             )
 
     def _embed(self, graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """Embed the input nodes."""
-        # TODO check if this does what it should
+        # embeds scalar features
         s = graph.nodes.s
+        if self._node_type == "continuous":
+            s = jnp.asarray(s, dtype=jnp.float32)
+            if len(s.shape) == 1:
+                s = s[:, jnp.newaxis]
+        if self._node_type == "discrete":
+            s = jnp.asarray(s, dtype=jnp.int32)
+        s = self.scalar_emb(s)
+
+        # embeds vector features
         if graph.nodes.v is not None:
             # initialize the vector with the global positions
             v = graph.nodes.v
-            v = jnp.reshape(v, (s.shape[0], 3, v.shape[-1]))
+            v = jnp.reshape(v, (s.shape[0], 3, v.shape[-1] // 3))
+            v = self.vector_emb(v)
         else:
             # initialize the vector with zeros (as in the paper)
-            # TODO check if they remain zeros after embedding
-            v = jnp.zeros((s.shape[0], 3, 1))
+            v = jnp.zeros((s.shape[0], 3, s.shape[-1]))
 
-        s = self.scalar_embedding(s)[:, jnp.newaxis, :]
-        v = self.vector_embedding(v)
-
-        return graph._replace(nodes=graph.nodes._replace(s=s, v=v))
+        return graph._replace(nodes=NodeFeatures(s=s, v=v))
 
     def __call__(self, graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
@@ -338,10 +353,10 @@ class PaiNN(hk.Module):
             return_intermediate=True was used.
         """
         # compute atom and pair features
-        norm_ij = jnp.linalg.norm(graph.edges, axis=1, keepdims=True)
+        norm_ij = jnp.sqrt(jnp.sum(graph.edges**2, axis=1, keepdims=True) + self._eps)
         # TODO this only makes sense for displacement vectors as edges/r_ij
-        dir_ij = graph.edges / norm_ij
-        phi_ij = self.radial_basis_fn(norm_ij)
+        dir_ij = graph.edges / (norm_ij + self._eps)
+        phi_ij = self.radial_basis_fn(jnp.squeeze(norm_ij))
         # replace edges with normalized directions
         graph = graph._replace(edges=dir_ij)
 
@@ -349,7 +364,7 @@ class PaiNN(hk.Module):
             norm_ij = self.cutoff_fn(norm_ij)  # pylint: disable=not-callable
 
         # compute filters
-        filters = self.filter_net(phi_ij) * norm_ij[..., jnp.newaxis]
+        filters = self.filter_net(phi_ij) * norm_ij
         if self._shared_filters:
             filter_list = [filters] * self._n_layers
         else:
@@ -364,4 +379,6 @@ class PaiNN(hk.Module):
         # readout
         if self.readout is not None:
             s, v = self.readout(graph)
+        else:
+            s, v = graph.nodes
         return jnp.squeeze(s), jnp.squeeze(v)
