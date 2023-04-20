@@ -18,12 +18,17 @@ pip install --upgrade "jax[cuda]==0.4.8" -f https://storage.googleapis.com/jax-r
 ``` -->
 
 <!-- ## Validation
+
 |                  |  MSE  | Inference [ms]* |
 |------------------|-------|-----------------|
 | torch (original) |       |                 |
 | jax (ours)       |       |                 |
 
-\* remeasured (Quadro RTX 4000) -->
+\* remeasured (Quadro RTX 4000)
+
+NOTE: The validation is not well written and is quite convoluted and is here only to compare the performance of the two implementations.
+
+-->
 
 ## Acknowledgements
 This implementation is almost a minimal translation of the official torch PaiNN implementation from [schnetpack](https://github.com/atomistic-machine-learning/schnetpack).
