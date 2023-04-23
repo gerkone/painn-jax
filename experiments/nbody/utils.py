@@ -1,14 +1,15 @@
 from typing import Callable, List, Optional, Tuple
 
 import jax.numpy as jnp
+import jraph
 import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from torch_geometric.nn import knn_graph
-import jraph
+
+from painn_jax.painn import NodeFeatures, PaiNNReadout, ReadoutBuilderFn
 
 from .datasets import ChargedDataset, GravityDataset
-from painn_jax import NodeFeatures
 
 
 def NbodyGraphTransform(
@@ -54,7 +55,9 @@ def NbodyGraphTransform(
 
         nodes = NodeFeatures(
             s=jnp.concatenate([vel_abs, q], axis=-1),
-            v=jnp.concatenate([norm_loc[:, jnp.newaxis], vel[:, jnp.newaxis]], axis=-1),
+            v=jnp.concatenate(
+                [norm_loc[..., jnp.newaxis], vel[..., jnp.newaxis]], axis=-1
+            ),
         )
 
         graph = jraph.GraphsTuple(
@@ -85,53 +88,55 @@ def numpy_collate(batch):
         return jnp.array(batch)
 
 
-def setup_nbody_data(args) -> Tuple[DataLoader, DataLoader, DataLoader, Callable]:
+def setup_nbody_data(
+    args,
+) -> Tuple[DataLoader, DataLoader, DataLoader, Callable, Callable, ReadoutBuilderFn]:
     if args.dataset == "charged":
         dataset_train = ChargedDataset(
             partition="train",
-            dataset_name=args.dataset_name,
-            max_samples=args.max_samples,
-            n_bodies=args.n_bodies,
+            dataset_name="small",
+            max_samples=3000,
+            n_bodies=5,
         )
         dataset_val = ChargedDataset(
             partition="val",
-            dataset_name=args.dataset_name,
-            n_bodies=args.n_bodies,
+            dataset_name="small",
+            n_bodies=5,
         )
         dataset_test = ChargedDataset(
             partition="test",
-            dataset_name=args.dataset_name,
-            n_bodies=args.n_bodies,
+            dataset_name="small",
+            n_bodies=5,
         )
 
     if args.dataset == "gravity":
         dataset_train = GravityDataset(
             partition="train",
-            dataset_name=args.dataset_name,
-            max_samples=args.max_samples,
+            dataset_name="small",
+            max_samples=3000,
             neighbours=args.neighbours,
             target=args.target,
-            n_bodies=args.n_bodies,
+            n_bodies=100,
         )
         dataset_val = GravityDataset(
             partition="val",
-            dataset_name=args.dataset_name,
+            dataset_name="small",
             neighbours=args.neighbours,
             target=args.target,
-            n_bodies=args.n_bodies,
+            n_bodies=100,
         )
         dataset_test = GravityDataset(
             partition="test",
-            dataset_name=args.dataset_name,
+            dataset_name="small",
             neighbours=args.neighbours,
             target=args.target,
-            n_bodies=args.n_bodies,
+            n_bodies=100,
         )
 
     graph_transform = NbodyGraphTransform(
-        n_nodes=args.n_bodies,
+        n_nodes=dataset_train.n_bodies,
         batch_size=args.batch_size,
-        neighbours=args.neighbours,
+        neighbours=5,
         relative_target=(args.target == "pos"),
         dataset_name=args.dataset,
     )
@@ -158,4 +163,4 @@ def setup_nbody_data(args) -> Tuple[DataLoader, DataLoader, DataLoader, Callable
         collate_fn=numpy_collate,
     )
 
-    return loader_train, loader_val, loader_test, graph_transform
+    return loader_train, loader_val, loader_test, graph_transform, None, PaiNNReadout

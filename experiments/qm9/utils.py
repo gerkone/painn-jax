@@ -1,24 +1,45 @@
 import os
-import time
-from functools import partial
 from typing import Callable, Dict, Tuple
-import torch
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import jax.tree_util as tree
 import jraph
-import optax
 import schnetpack.transform as trn
-from schnetpack.datasets import QM9, AtomsDataModule
+from schnetpack.datasets import QM9, AtomsLoader
 
-from painn_jax.painn import NodeFeatures
+from painn_jax.blocks import LinearXav, pooling
+from painn_jax.painn import NodeFeatures, PaiNNReadout, ReadoutBuilderFn
+
+
+def add_offsets(mean: float, atomrefs: jnp.ndarray) -> Callable:
+    @jax.jit
+    def _postprocess(graph: jraph.GraphsTuple, target: jnp.ndarray) -> jnp.ndarray:
+        target = target + mean
+        y0 = pooling(graph._replace(nodes=NodeFeatures(s=atomrefs[graph.nodes])))[0]
+        target = (target + jnp.squeeze(y0)) * jraph.get_graph_padding_mask(graph)
+        return target
+
+    return _postprocess
+
+
+def remove_offsets(mean: float, atomrefs: jnp.ndarray) -> Callable:
+    @jax.jit
+    def _postprocess(graph: jraph.GraphsTuple, target: jnp.ndarray) -> jnp.ndarray:
+        target = target - mean * graph.n_node
+        y0 = pooling(graph._replace(nodes=NodeFeatures(s=atomrefs[graph.nodes])))[0]
+        target = (target - jnp.squeeze(y0)) * jraph.get_graph_padding_mask(graph)
+        return target
+
+    return _postprocess
 
 
 def QM9GraphTransform(
     args,
     max_batch_nodes: int,
     max_batch_edges: int,
+    train_trn: Callable,
 ) -> Callable:
     """
     Build a function that converts torch DataBatch into jax GraphsTuple.
@@ -26,7 +47,9 @@ def QM9GraphTransform(
     Mostly a quick fix out of lazyness. Rewriting QM9 in jax is not trivial.
     """
 
-    def _to_jax_graph(data: Dict) -> Tuple[jraph.GraphsTuple, jnp.array]:
+    def _to_jax_graph(
+        data: Dict, training: bool = True
+    ) -> Tuple[jraph.GraphsTuple, jnp.array]:
         senders = jnp.array(data["_idx_i"], dtype=jnp.int32)
         receivers = jnp.array(data["_idx_j"], dtype=jnp.int32)
         loc = jnp.array(data["_positions"])
@@ -42,7 +65,8 @@ def QM9GraphTransform(
             receivers=receivers,
             n_node=jnp.array(data["_n_atoms"]),
             n_edge=jnp.array([len(senders)]),  # TODO
-            globals=None,
+            # small hack to get positions into the graph
+            globals=jnp.pad(loc, [(0, max_batch_nodes - loc.shape[0] - 1), (0, 0)]),
         )
         graph = jraph.pad_with_graphs(
             graph,
@@ -52,45 +76,44 @@ def QM9GraphTransform(
         )
 
         # pad target
+        target = jnp.array(data[args.prop])
         if args.task == "node":
-            target = jnp.array(data[args.prop])
-            target = jnp.pad(target, [(0, max_batch_nodes - target.shape[0])])
+            target = jnp.pad(target, [(0, max_batch_nodes - target.shape[0] - 1)])
         if args.task == "graph":
-            target = jnp.append(jnp.array(data[args.prop]), 0)
+            target = jnp.append(target, 0)
+
+        # normalize targets
+        if training and train_trn is not None:
+            target = train_trn(graph, target)
+
         return graph, target
 
     return _to_jax_graph
 
 
-def setup_qm9_data(args) -> Tuple[AtomsDataModule, Callable]:
+def setup_qm9_data(
+    args,
+) -> Tuple[AtomsLoader, AtomsLoader, AtomsLoader, Callable, Callable, ReadoutBuilderFn]:
     qm9tut = "./qm9tut"
     if not os.path.exists("qm9tut"):
         os.makedirs(qm9tut)
-
     try:
         os.remove("split.npz")
     except OSError:
         pass
 
-    transforms = []
-    if args.target == "U0":
-        transforms = [
-            trn.MatScipyNeighborList(cutoff=args.radius),
-            trn.RemoveOffsets(args.prop, remove_mean=True, remove_atomrefs=True),
-        ]
-    if args.target == "mu":
-        transforms = [
-            trn.SubtractCenterOfMass(),
-            trn.MatScipyNeighborList(cutoff=args.radius),
-        ]
-    transforms.append(trn.CastTo32())
+    transforms = [
+        trn.SubtractCenterOfMass(),
+        trn.MatScipyNeighborList(args.radius),
+        trn.CastTo32(),
+    ]
     dataset = QM9(
         "./qm9.db",
-        num_train=5000,
-        num_val=1000,
-        num_test=1000,
+        num_train=110000,
+        num_val=10000,
         batch_size=args.batch_size,
         transforms=transforms,
+        remove_uncharacterized=True,
         num_workers=6,
         split_file=os.path.join(qm9tut, "split.npz"),
         pin_memory=False,
@@ -98,6 +121,20 @@ def setup_qm9_data(args) -> Tuple[AtomsDataModule, Callable]:
     )
     dataset.prepare_data()
     dataset.setup()
+
+    train_target_transform = None
+    eval_target_transform = None
+    custom_readout = None
+    if args.target == "U0":
+        mean = float(dataset.get_stats(args.prop, True, True)[0])
+        atomref = jnp.array(
+            dataset.train_dataset.atomrefs[args.prop], dtype=jnp.float32
+        )
+        train_target_transform = remove_offsets(mean, atomref)
+        eval_target_transform = add_offsets(mean, atomref)
+        custom_readout = PaiNNReadout
+    if args.target == "mu":
+        custom_readout = DipoleReadout
 
     # TODO: lazy and naive
     max_batch_nodes = int(
@@ -109,95 +146,79 @@ def setup_qm9_data(args) -> Tuple[AtomsDataModule, Callable]:
         args,
         max_batch_nodes=max_batch_nodes,
         max_batch_edges=max_batch_edges,
+        train_trn=train_target_transform,
     )
 
-    return dataset, to_graphs_tuple
+    loader_train = dataset.train_dataloader()
+    loader_val = dataset.val_dataloader()
+    loader_test = dataset.test_dataloader()
+
+    return (
+        loader_train,
+        loader_val,
+        loader_test,
+        to_graphs_tuple,
+        eval_target_transform,
+        custom_readout,
+    )
 
 
-@partial(jax.jit, static_argnames=["model_fn", "task"])
-def predict(
-    model_fn: hk.TransformedWithState,
-    params: hk.Params,
-    state: hk.State,
-    graph: jraph.GraphsTuple,
+def DipoleReadout(
+    hidden_size: int,
     task: str,
-) -> Tuple[jnp.ndarray, hk.State]:
-    (pred, _), state = model_fn(params, state, graph)
-    if task == "node":
+    pool: str = "sum",
+    out_channels: int = 1,
+    activation: Callable = jax.nn.silu,
+    blocks: int = 2,
+    eps: float = 1e-8,
+) -> Callable:
+    """
+    PaiNN readout block modified for dipole moment prediction.
+
+    Args:
+        hidden_size: Number of hidden channels.
+        task: Task to perform. Either "node" or "graph".
+        pool: pool method. Either "sum" or "avg".
+        scalar_out_channels: Number of scalar/vector output channels.
+        activation: Activation function.
+        blocks: Number of readout blocks.
+    """
+
+    assert task in ["node", "graph"], "task must be node or graph"
+    assert pool in ["sum", "avg"], "pool must be sum or avg"
+    if pool == "avg":
+        pool_fn = jraph.segment_mean
+    if pool == "sum":
+        pool_fn = jraph.segment_sum
+
+    def _readout(graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        charges = hk.Sequential(
+            [LinearXav(hidden_size), activation] * (blocks - 1)
+            + [LinearXav(out_channels)],
+            name="dipole_charge_net",
+        )(graph.nodes.s)
+
+        charges = jnp.squeeze(charges)
+
+        sum_charge, _ = pooling(graph._replace(nodes=NodeFeatures(s=charges)), pool_fn)
+
         mask = jraph.get_node_padding_mask(graph)
-    if task == "graph":
-        mask = jraph.get_graph_padding_mask(graph)
-    pred = pred * mask
-    return pred, state
+        # same as _idx_m in schnetpack
+        n_graphs = graph.n_node.shape[0]
+        graph_idx = jnp.arange(n_graphs)
+        # equivalent to jnp.sum(n_node), but jittable
+        sum_n_node = tree.tree_leaves(graph.nodes)[0].shape[0]
+        batch = jnp.repeat(graph_idx, graph.n_node, 0, total_repeat_length=sum_n_node)
 
+        charge_correction = -sum_charge / jnp.sum(mask)  # pylint: disable=E1130
+        charges = charges + charge_correction[batch]
 
-@partial(jax.jit, static_argnames=["model_fn", "task"])
-def train_mse(
-    params: hk.Params,
-    state: hk.State,
-    graph: jraph.GraphsTuple,
-    target: jnp.ndarray,
-    model_fn: Callable,
-    task: str,
-) -> Tuple[float, hk.State]:
-    pred, state = predict(model_fn, params, state, graph, task)
-    assert target.shape == pred.shape
-    return jnp.mean(jnp.power(pred - target, 2)), state
+        loc = graph.globals
+        mu = loc * charges[:, jnp.newaxis]
 
+        # aggregate and normalize
+        mu, _ = pooling(graph._replace(nodes=NodeFeatures(s=mu)), pool_fn)
+        mu = jnp.sqrt(jnp.sum(mu**2, axis=1) + eps)
+        return jnp.squeeze(mu), None
 
-def eval_mae(
-    params: hk.Params,
-    state: hk.State,
-    data: Dict,
-    graph: jraph.GraphsTuple,
-    target: jnp.ndarray,
-    model_fn: Callable,
-    prop: str,
-    task: str,
-) -> Tuple[float, hk.State]:
-    pred = jax.lax.stop_gradient(predict(model_fn, params, state, graph, task)[0])[:-1]
-    target = target[:-1]
-    if prop == QM9.U0:
-        # lazy hack to get same eval targets as torch
-        data[prop] = torch.tensor(pred.tolist())
-        pred = jnp.array(
-            trn.AddOffsets(prop, add_mean=True, add_atomrefs=True)(data)[prop]
-        )
-    assert target.shape == pred.shape
-    return jnp.mean(jnp.abs(pred - target))
-
-
-@partial(jax.jit, static_argnames=["loss_fn", "opt_update"])
-def update(
-    params: hk.Params,
-    state: hk.State,
-    graph: jraph.GraphsTuple,
-    target: jnp.ndarray,
-    opt_state: optax.OptState,
-    loss_fn: Callable,
-    opt_update: Callable,
-) -> Tuple[float, hk.Params, hk.State, optax.OptState]:
-    (loss, state), grads = jax.value_and_grad(loss_fn, has_aux=True, allow_int=True)(
-        params, state, graph, target
-    )
-    updates, opt_state = opt_update(grads, opt_state, params)
-    return loss, optax.apply_updates(params, updates), state, opt_state
-
-
-def evaluate(
-    loader,
-    params: hk.Params,
-    state: hk.State,
-    loss_fn: Callable,
-    graph_transform: Callable,
-) -> Tuple[float, float]:
-    eval_loss = 0.0
-    eval_times = 0.0
-    for data in loader:
-        graph, target = graph_transform(data)
-        eval_start = time.perf_counter_ns()
-        loss = jax.lax.stop_gradient(loss_fn(params, state, data, graph, target))
-        eval_loss += jax.block_until_ready(loss)
-        eval_times += (time.perf_counter_ns() - eval_start) / 1e6
-
-    return eval_times / len(loader), eval_loss / len(loader)
+    return _readout

@@ -31,6 +31,8 @@ class BaseDataset(ABC):
         self.max_samples = int(max_samples)
         self.normalize = normalize
 
+        self.n_bodies = n_bodies
+
         self.data = None
 
     def get_n_nodes(self):
