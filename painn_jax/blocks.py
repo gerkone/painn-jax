@@ -72,17 +72,17 @@ class GatedEquivariantBlock(hk.Module):
 
         v_l_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2) + self._eps)
         gating_scalars = jnp.concatenate([s, v_l_norm], axis=-1)
-        s_out, _, x = jnp.split(
+        s, _, x = jnp.split(
             self.gate_block(gating_scalars),
             [self._scalar_out_channels, self._vector_out_channels],
             axis=-1,
         )
-        v_out = x[:, jnp.newaxis] * v_r
+        v = x[:, jnp.newaxis] * v_r
 
         if self.scalar_activation:
-            s_out = self.scalar_activation(s_out)
+            s = self.scalar_activation(s)
 
-        return s_out, v_out
+        return s, v
 
 
 def pooling(

@@ -16,6 +16,10 @@ class NodeFeatures(NamedTuple):
     v: jnp.ndarray = None
 
 
+ReadoutFn = Callable[[jraph.GraphsTuple], Tuple[jnp.ndarray, jnp.ndarray]]
+ReadoutBuilderFn = Callable[..., ReadoutFn]
+
+
 def PaiNNReadout(
     hidden_size: int,
     task: str,
@@ -24,7 +28,7 @@ def PaiNNReadout(
     activation: Callable = jax.nn.silu,
     blocks: int = 2,
     eps: float = 1e-8,
-) -> Callable:
+) -> ReadoutFn:
     """
     PaiNN readout block.
 
@@ -48,11 +52,11 @@ def PaiNNReadout(
         s, v = graph.nodes
         s = jnp.squeeze(s)
         for i in range(blocks - 1):
-            ith_hidden_size = hidden_size // 2**i
+            ith_hidden_size = hidden_size // 2 ** (i + 1)
             s, v = GatedEquivariantBlock(
-                hidden_size=ith_hidden_size,
-                scalar_out_channels=ith_hidden_size // 2,
-                vector_out_channels=ith_hidden_size // 2,
+                hidden_size=ith_hidden_size * 2,
+                scalar_out_channels=ith_hidden_size,
+                vector_out_channels=ith_hidden_size,
                 activation=activation,
                 eps=eps,
                 name=f"readout_block_{i}",
@@ -63,7 +67,7 @@ def PaiNNReadout(
             s, v = pooling(graph, aggregate_fn=pool_fn)
 
         s, v = GatedEquivariantBlock(
-            hidden_size=out_channels * 2,
+            hidden_size=ith_hidden_size,
             scalar_out_channels=out_channels,
             vector_out_channels=out_channels,
             activation=activation,
@@ -71,7 +75,7 @@ def PaiNNReadout(
             name="readout_block_out",
         )(s, v)
 
-        return s, v
+        return jnp.squeeze(s), jnp.squeeze(v)
 
     return _readout
 
@@ -82,10 +86,10 @@ class PaiNNLayer(hk.Module):
     def __init__(
         self,
         hidden_size: int,
-        activation: Callable,
         layer_num: int,
+        activation: Callable = jax.nn.silu,
         blocks: int = 2,
-        aggregate_fn: Optional[Callable] = jraph.segment_sum,
+        aggregate_fn: Callable = jraph.segment_sum,
         eps: float = 1e-8,
     ):
         """
@@ -156,11 +160,11 @@ class PaiNNLayer(hk.Module):
         ds, dv1, dv2 = jnp.split(Wij * xj, 3, axis=-1)
         n_nodes = tree.tree_leaves(s)[0].shape[0]
         ds = self._aggregate_fn(ds, senders, n_nodes)
-        dv = dv1[:, jnp.newaxis] * dir_ij[..., jnp.newaxis] + dv2[:, jnp.newaxis] * vj
+        dv = dv1 * dir_ij[..., jnp.newaxis] + dv2 * vj
         dv = self._aggregate_fn(dv, senders, n_nodes)
 
-        s = s + jnp.clip(ds, -1e4, 1e4)
-        v = v + jnp.clip(dv, -1e4, 1e4)
+        s = s + jnp.clip(ds, -1e2, 1e2)
+        v = v + jnp.clip(dv, -1e2, 1e2)
 
         return s, v
 
@@ -178,15 +182,15 @@ class PaiNNLayer(hk.Module):
         """
         ## intra-atomic
         v_l, v_r = jnp.split(self.vector_mixing_block(v), 2, axis=-1)
-        v_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2) + self._eps)
+        v_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2, keepdims=True) + self._eps)
 
         ts = jnp.concatenate([s, v_norm], axis=-1)
         ds, dv, dsv = jnp.split(self.mixing_block(ts), 3, axis=-1)
-        dv = dv[:, jnp.newaxis] * v_r
-        dsv = dsv * jnp.sum(v_l * v_r, axis=1)
+        dv = dv * v_r
+        dsv = dsv * jnp.sum(v_l * v_r, axis=1, keepdims=True)
 
-        s = s + jnp.clip(ds + dsv, -1e4, 1e4)
-        v = v + jnp.clip(dv, -1e4, 1e4)
+        s = s + jnp.clip(ds + dsv, -1e2, 1e2)
+        v = v + jnp.clip(dv, -1e2, 1e2)
         return s, v
 
     def __call__(
@@ -225,18 +229,21 @@ class PaiNN(hk.Module):
         hidden_size: int,
         n_layers: int,
         radial_basis_fn: Callable,
+        *args,
         cutoff_fn: Optional[Callable] = None,
         radius: float = 5.0,
         n_rbf: int = 20,
         activation: Callable = jax.nn.silu,
         node_type: str = "discrete",
         task: str = "node",
-        pool: str = "avg",
+        pool: str = "sum",
         out_channels: Optional[int] = None,
+        readout_fn: ReadoutBuilderFn = PaiNNReadout,
         max_z: int = 100,
         shared_interactions: bool = False,
         shared_filters: bool = False,
         eps: float = 1e-8,
+        **kwargs,
     ):
         """Initialize the model.
 
@@ -252,6 +259,7 @@ class PaiNN(hk.Module):
             task: Regression task to perform. Either "node"-wise or "graph"-wise.
             pool: Node readout pool method. Only used in "graph" tasks.
             out_channels: Number of output scalar/vector channels. Used in readout.
+            readout_fn: Readout function. If None, use default PaiNNReadout.
             max_z: Maximum atomic number. Used in discrete node feature embedding.
             shared_interactions: If True, share the weights across interaction blocks.
             shared_filters: If True, share the weights across filter networks.
@@ -296,24 +304,23 @@ class PaiNN(hk.Module):
             self.filter_net = LinearXav(n_layers * 3 * hidden_size, name="filter_net")
 
         if self._shared_interactions:
-            self.layers = [
-                PaiNNLayer(hidden_size, activation, layer_num=0, eps=eps)
-            ] * n_layers
+            self.layers = [PaiNNLayer(hidden_size, 0, activation, eps=eps)] * n_layers
         else:
             self.layers = [
-                PaiNNLayer(hidden_size, activation, layer_num=i, eps=eps)
-                for i in range(n_layers)
+                PaiNNLayer(hidden_size, i, activation, eps=eps) for i in range(n_layers)
             ]
 
         self.readout = None
-        if out_channels is not None:
-            self.readout = PaiNNReadout(
+        if out_channels is not None and readout_fn is not None:
+            self.readout = readout_fn(
+                *args,
                 hidden_size,
                 task,
                 pool,
                 out_channels=out_channels,
                 activation=activation,
                 eps=eps,
+                **kwargs,
             )
 
     def _embed(self, graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
@@ -326,13 +333,12 @@ class PaiNN(hk.Module):
                 s = s[:, jnp.newaxis]
         if self._node_type == "discrete":
             s = jnp.asarray(s, dtype=jnp.int32)
-        s = self.scalar_emb(s)
+        s = self.scalar_emb(s)[:, jnp.newaxis]
 
         # embeds vector features
         if graph.nodes.v is not None:
             # initialize the vector with the global positions
             v = graph.nodes.v
-            v = jnp.reshape(v, (s.shape[0], 3, v.shape[-1] // 3))
             v = self.vector_emb(v)
         else:
             # initialize the vector with zeros (as in the paper)
@@ -356,7 +362,7 @@ class PaiNN(hk.Module):
         norm_ij = jnp.sqrt(jnp.sum(graph.edges**2, axis=1, keepdims=True) + self._eps)
         # TODO this only makes sense for displacement vectors as edges/r_ij
         dir_ij = graph.edges / (norm_ij + self._eps)
-        phi_ij = self.radial_basis_fn(jnp.squeeze(norm_ij))
+        phi_ij = self.radial_basis_fn(norm_ij)
         # replace edges with normalized directions
         graph = graph._replace(edges=dir_ij)
 
@@ -364,7 +370,7 @@ class PaiNN(hk.Module):
             norm_ij = self.cutoff_fn(norm_ij)  # pylint: disable=not-callable
 
         # compute filters
-        filters = self.filter_net(phi_ij) * norm_ij
+        filters = self.filter_net(phi_ij) * norm_ij[:, jnp.newaxis]
         if self._shared_filters:
             filter_list = [filters] * self._n_layers
         else:
@@ -380,5 +386,5 @@ class PaiNN(hk.Module):
         if self.readout is not None:
             s, v = self.readout(graph)
         else:
-            s, v = graph.nodes
-        return jnp.squeeze(s), jnp.squeeze(v)
+            s, v = jnp.squeeze(graph.nodes.s), jnp.squeeze(graph.nodes.v)
+        return s, v

@@ -62,6 +62,7 @@ disable=C0114, # module docstring
         C0103, # bad function names
         C0415, # import outside toplevel
         W0212, # protected access
+        C0412, # ungrouped imports
         abstract-method,
         apply-builtin,
         arguments-differ,
