@@ -328,10 +328,12 @@ class PaiNN(hk.Module):
         # embeds scalar features
         s = graph.nodes.s
         if self._node_type == "continuous":
+            # e.g. velocities
             s = jnp.asarray(s, dtype=jnp.float32)
             if len(s.shape) == 1:
                 s = s[:, jnp.newaxis]
         if self._node_type == "discrete":
+            # e.g. atomic numbers
             s = jnp.asarray(s, dtype=jnp.int32)
         s = self.scalar_emb(s)[:, jnp.newaxis]
 
@@ -341,10 +343,28 @@ class PaiNN(hk.Module):
             v = graph.nodes.v
             v = self.vector_emb(v)
         else:
-            # initialize the vector with zeros (as in the paper)
+            # if no directional info, initialize the vector with zeros (as in the paper)
             v = jnp.zeros((s.shape[0], 3, s.shape[-1]))
 
         return graph._replace(nodes=NodeFeatures(s=s, v=v))
+
+    def _get_filters(self, norm_ij: jnp.ndarray) -> jnp.ndarray:
+        r"""Compute the rotationally invariant filters :math:`W_s`.
+
+        .. math::
+            W_s = MLP(RBF(\|\vector{r}_{ij}\|)) * f_{cut}(\|\vector{r}_{ij}\|)
+        """
+        phi_ij = self.radial_basis_fn(norm_ij)
+        if self.cutoff_fn is not None:
+            cut_norm_ij = self.cutoff_fn(norm_ij)  # pylint: disable=not-callable
+        # compute filters
+        filters = self.filter_net(phi_ij) * cut_norm_ij[:, jnp.newaxis]
+        # split into layer-wise filters
+        if self._shared_filters:
+            filter_list = [filters] * self._n_layers
+        else:
+            filter_list = jnp.split(filters, self._n_layers, axis=-1)
+        return filter_list
 
     def __call__(self, graph: jraph.GraphsTuple) -> Tuple[jnp.ndarray, jnp.ndarray]:
         """
@@ -360,31 +380,25 @@ class PaiNN(hk.Module):
         """
         # compute atom and pair features
         norm_ij = jnp.sqrt(jnp.sum(graph.edges**2, axis=1, keepdims=True) + self._eps)
-        # TODO this only makes sense for displacement vectors as edges/r_ij
+        # edge directions.
+        # NOTE: assumes edge features are displacement vectors.
         dir_ij = graph.edges / (norm_ij + self._eps)
-        phi_ij = self.radial_basis_fn(norm_ij)
-        # replace edges with normalized directions
         graph = graph._replace(edges=dir_ij)
 
-        if self.cutoff_fn is not None:
-            norm_ij = self.cutoff_fn(norm_ij)  # pylint: disable=not-callable
+        # compute filters (r_ij track in message block from the paper)
+        filter_list = self._get_filters(norm_ij)
 
-        # compute filters
-        filters = self.filter_net(phi_ij) * norm_ij[:, jnp.newaxis]
-        if self._shared_filters:
-            filter_list = [filters] * self._n_layers
-        else:
-            filter_list = jnp.split(filters, self._n_layers, axis=-1)
-
+        # embeds node scalar features (and vector, if present)
         graph = self._embed(graph)
 
         # message passing
         for n, layer in enumerate(self.layers):
             graph = layer(graph, filter_list[n])
 
-        # readout
         if self.readout is not None:
+            # return decoded representations
             s, v = self.readout(graph)
         else:
+            # return representations (last layer embedding)
             s, v = jnp.squeeze(graph.nodes.s), jnp.squeeze(graph.nodes.v)
         return s, v

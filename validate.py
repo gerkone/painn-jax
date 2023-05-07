@@ -14,7 +14,7 @@ key = jax.random.PRNGKey(1337)
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # Run parameters
-    parser.add_argument("--epochs", type=int, default=500, help="Number of epochs")
+    parser.add_argument("--epochs", type=int, default=100, help="Number of epochs")
     parser.add_argument(
         "--batch-size",
         type=int,
