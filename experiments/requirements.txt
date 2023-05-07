@@ -1,7 +1,9 @@
---find-links https://data.pyg.org/whl/torch-1.13.0+cpu.html
+--extra-index-url https://download.pytorch.org/whl/cpu
 
-schnetpack==2.0.1
-torch==1.13.0
+--find-links https://data.pyg.org/whl/torch-1.13.1+cpu.html
+
+schnetpack==2.0.3
+torch==1.13.1
 torch-cluster==1.6.0
 torch-geometric==2.1.0
 torch-scatter==2.1.0
