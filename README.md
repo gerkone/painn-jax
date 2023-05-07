@@ -26,6 +26,7 @@ This implementation is validated on QM9 on the dipole moment target. The results
 |------------------|-------|-----------------|
 | jax (ours)       | 0.014 |      8.42*      |
 | torch (original) | 0.012 |     163.23      |
+
 \* padded (naive)
 
 __NOTE: The validation is not well written and is quite convoluted since it uses the [QM9 dataset from schnetpack](https://github.com/atomistic-machine-learning/schnetpack/blob/master/src/schnetpack/datasets/qm9.py). It is here only to compare the performance of the two implementations.__
