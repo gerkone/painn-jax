@@ -24,7 +24,7 @@ class LinearXav(hk.Linear):
 
 
 class GatedEquivariantBlock(hk.Module):
-    """Gated equivariant block (restricted to L=1, vectorial features).
+    """Gated equivariant block (restricted to vectorial features). FIG 3 in the paper.
 
     References:
         [#painn1] Schütt, Unke, Gastegger:
@@ -45,7 +45,7 @@ class GatedEquivariantBlock(hk.Module):
     ):
         super().__init__(name)
 
-        # TODO support out channels = 0
+        assert scalar_out_channels > 0 and vector_out_channels > 0
         self._scalar_out_channels = scalar_out_channels
         self._vector_out_channels = vector_out_channels
         self._eps = eps
@@ -70,14 +70,15 @@ class GatedEquivariantBlock(hk.Module):
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
         v_l, v_r = jnp.split(self.vector_mix_net(v), 2, axis=-1)
 
-        v_l_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2) + self._eps)
-        gating_scalars = jnp.concatenate([s, v_l_norm], axis=-1)
-        s, _, x = jnp.split(
+        v_r_norm = jnp.sqrt(jnp.sum(v_r**2, axis=-2) + self._eps)
+        gating_scalars = jnp.concatenate([s, v_r_norm], axis=-1)
+        s, _, v_gate = jnp.split(
             self.gate_block(gating_scalars),
             [self._scalar_out_channels, self._vector_out_channels],
             axis=-1,
         )
-        v = x[:, jnp.newaxis] * v_r
+        # scale the vectors by the gating scalars
+        v = v_l * v_gate[:, jnp.newaxis]
 
         if self.scalar_activation:
             s = self.scalar_activation(s)

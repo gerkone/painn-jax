@@ -138,7 +138,7 @@ class PaiNNLayer(hk.Module):
         senders: jnp.ndarray,
         receivers: jnp.ndarray,
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Message/interaction.
+        """Message/interaction. Inter-particle.
 
         Args:
             s (jnp.ndarray): Input scalar features.
@@ -149,9 +149,8 @@ class PaiNNLayer(hk.Module):
             receivers (jnp.ndarray): Index of the receiver node.
 
         Returns:
-            Node features after interaction.
+            Aggregated messages after interaction.
         """
-        # inter-particle
         x = self.interaction_block(s)
 
         xj = x[receivers]
@@ -159,8 +158,9 @@ class PaiNNLayer(hk.Module):
 
         ds, dv1, dv2 = jnp.split(Wij * xj, 3, axis=-1)
         n_nodes = tree.tree_leaves(s)[0].shape[0]
-        ds = self._aggregate_fn(ds, senders, n_nodes)
         dv = dv1 * dir_ij[..., jnp.newaxis] + dv2 * vj
+        # aggregate scalars and vectors
+        ds = self._aggregate_fn(ds, senders, n_nodes)
         dv = self._aggregate_fn(dv, senders, n_nodes)
 
         s = s + jnp.clip(ds, -1e2, 1e2)
@@ -171,23 +171,22 @@ class PaiNNLayer(hk.Module):
     def _update(
         self, s: jnp.ndarray, v: jnp.ndarray
     ) -> Tuple[jnp.ndarray, jnp.ndarray]:
-        """Update/mixing.
+        """Update/mixing. Intra-particle.
 
         Args:
             s (jnp.ndarray): Input scalar features.
             v (jnp.ndarray): Input vector features.
 
         Returns:
-            Node features after interaction.
+            Node features after update.
         """
-        ## intra-atomic
         v_l, v_r = jnp.split(self.vector_mixing_block(v), 2, axis=-1)
-        v_norm = jnp.sqrt(jnp.sum(v_l**2, axis=-2, keepdims=True) + self._eps)
+        v_norm = jnp.sqrt(jnp.sum(v_r**2, axis=-2, keepdims=True) + self._eps)
 
         ts = jnp.concatenate([s, v_norm], axis=-1)
         ds, dv, dsv = jnp.split(self.mixing_block(ts), 3, axis=-1)
-        dv = dv * v_r
-        dsv = dsv * jnp.sum(v_l * v_r, axis=1, keepdims=True)
+        dv = v_l * dv
+        dsv = dsv * jnp.sum(v_r * v_l, axis=1, keepdims=True)
 
         s = s + jnp.clip(ds + dsv, -1e2, 1e2)
         v = v + jnp.clip(dv, -1e2, 1e2)
@@ -207,7 +206,6 @@ class PaiNNLayer(hk.Module):
         Returns:
             atom features after interaction
         """
-        # TODO make this work with jraph GNN functions
         s, v = graph.nodes
         s, v = self._message(s, v, graph.edges, Wij, graph.senders, graph.receivers)
         s, v = self._update(s, v)

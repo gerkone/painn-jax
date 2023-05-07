@@ -64,7 +64,7 @@ def QM9GraphTransform(
             senders=senders,
             receivers=receivers,
             n_node=jnp.array(data["_n_atoms"]),
-            n_edge=jnp.array([len(senders)]),  # TODO
+            n_edge=jnp.array([len(senders)]),
             # small hack to get positions into the graph
             globals=jnp.pad(loc, [(0, max_batch_nodes - loc.shape[0] - 1), (0, 0)]),
         )
@@ -136,7 +136,6 @@ def setup_qm9_data(
     if args.target == "mu":
         custom_readout = DipoleReadout
 
-    # TODO: lazy and naive
     max_batch_nodes = int(
         1.3 * max(sum(d["_n_atoms"]) for d in dataset.val_dataloader())
     )
