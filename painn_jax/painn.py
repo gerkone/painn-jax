@@ -141,10 +141,10 @@ class PaiNNLayer(hk.Module):
         """Message/interaction. Inter-particle.
 
         Args:
-            s (jnp.ndarray): Input scalar features.
-            v (jnp.ndarray): Input vector features.
-            dir_ij (jnp.ndarray): Direction of the edge.
-            Wij (jnp.ndarray): Filter.
+            s (jnp.ndarray): Input scalar features (n_nodes, 1, hidden_size).
+            v (jnp.ndarray): Input vector features (n_nodes, 3, hidden_size).
+            dir_ij (jnp.ndarray): Direction of the edge (n_edges, 3).
+            Wij (jnp.ndarray): Filter (n_edges, 1, 3 * hidden_size).
             senders (jnp.ndarray): Index of the sender node.
             receivers (jnp.ndarray): Index of the receiver node.
 
@@ -156,9 +156,9 @@ class PaiNNLayer(hk.Module):
         xj = x[receivers]
         vj = v[receivers]
 
-        ds, dv1, dv2 = jnp.split(Wij * xj, 3, axis=-1)
+        ds, dv1, dv2 = jnp.split(Wij * xj, 3, axis=-1)  # (n_edges, 1, hidden_size)
         n_nodes = tree.tree_leaves(s)[0].shape[0]
-        dv = dv1 * dir_ij[..., jnp.newaxis] + dv2 * vj
+        dv = dv1 * dir_ij[..., jnp.newaxis] + dv2 * vj  # (n_edges, 3, hidden_size)
         # aggregate scalars and vectors
         ds = self._aggregate_fn(ds, senders, n_nodes)
         dv = self._aggregate_fn(dv, senders, n_nodes)
@@ -174,8 +174,8 @@ class PaiNNLayer(hk.Module):
         """Update/mixing. Intra-particle.
 
         Args:
-            s (jnp.ndarray): Input scalar features.
-            v (jnp.ndarray): Input vector features.
+            s (jnp.ndarray): Input scalar features (n_nodes, 1, hidden_size).
+            v (jnp.ndarray): Input vector features (n_nodes, 3, hidden_size).
 
         Returns:
             Node features after update.
@@ -183,7 +183,7 @@ class PaiNNLayer(hk.Module):
         v_l, v_r = jnp.split(self.vector_mixing_block(v), 2, axis=-1)
         v_norm = jnp.sqrt(jnp.sum(v_r**2, axis=-2, keepdims=True) + self._eps)
 
-        ts = jnp.concatenate([s, v_norm], axis=-1)
+        ts = jnp.concatenate([s, v_norm], axis=-1)  # (n_nodes, 1, 2 * hidden_size)
         ds, dv, dsv = jnp.split(self.mixing_block(ts), 3, axis=-1)
         dv = v_l * dv
         dsv = dsv * jnp.sum(v_r * v_l, axis=1, keepdims=True)
@@ -333,13 +333,13 @@ class PaiNN(hk.Module):
         if self._node_type == "discrete":
             # e.g. atomic numbers
             s = jnp.asarray(s, dtype=jnp.int32)
-        s = self.scalar_emb(s)[:, jnp.newaxis]
+        s = self.scalar_emb(s)[:, jnp.newaxis]  # (n_nodes, 1, hidden_size)
 
         # embeds vector features
         if graph.nodes.v is not None:
             # initialize the vector with the global positions
             v = graph.nodes.v
-            v = self.vector_emb(v)
+            v = self.vector_emb(v)  # (n_nodes, 3, hidden_size)
         else:
             # if no directional info, initialize the vector with zeros (as in the paper)
             v = jnp.zeros((s.shape[0], 3, s.shape[-1]))
@@ -356,7 +356,9 @@ class PaiNN(hk.Module):
         if self.cutoff_fn is not None:
             cut_norm_ij = self.cutoff_fn(norm_ij)  # pylint: disable=not-callable
         # compute filters
-        filters = self.filter_net(phi_ij) * cut_norm_ij[:, jnp.newaxis]
+        filters = (
+            self.filter_net(phi_ij) * cut_norm_ij[:, jnp.newaxis]
+        )  # (n_edges, 1, n_layers * 3 * hidden_size)
         # split into layer-wise filters
         if self._shared_filters:
             filter_list = [filters] * self._n_layers
@@ -369,12 +371,12 @@ class PaiNN(hk.Module):
         Compute representations/embeddings.
 
         Args:
-            inputs (dict of jnp.ndarray): SchNetPack dictionary of input tensors.
+            inputs: GraphsTuple. The nodes should cointain a NodeFeatures object with
+                - scalar feature of the shape (n_atoms, n_features)
+                - vector feature of the shape (n_atoms, 3, n_features)
 
         Returns:
-            jnp.ndarray: atom-wise representation.
-            list of jnp.ndarray: intermediate atom-wise representations, if
-            return_intermediate=True was used.
+            Tuple with scalar and vector representations/embeddings.
         """
         # compute atom and pair features
         norm_ij = jnp.sqrt(jnp.sum(graph.edges**2, axis=1, keepdims=True) + self._eps)
@@ -384,7 +386,7 @@ class PaiNN(hk.Module):
         graph = graph._replace(edges=dir_ij)
 
         # compute filters (r_ij track in message block from the paper)
-        filter_list = self._get_filters(norm_ij)
+        filter_list = self._get_filters(norm_ij)  # list (n_edges, 1, 3 * hidden_size)
 
         # embeds node scalar features (and vector, if present)
         graph = self._embed(graph)
