@@ -354,10 +354,10 @@ class PaiNN(hk.Module):
         """
         phi_ij = self.radial_basis_fn(norm_ij)
         if self.cutoff_fn is not None:
-            cut_norm_ij = self.cutoff_fn(norm_ij)  # pylint: disable=not-callable
+            norm_ij = self.cutoff_fn(norm_ij)
         # compute filters
         filters = (
-            self.filter_net(phi_ij) * cut_norm_ij[:, jnp.newaxis]
+            self.filter_net(phi_ij) * norm_ij[:, jnp.newaxis]
         )  # (n_edges, 1, n_layers * 3 * hidden_size)
         # split into layer-wise filters
         if self._shared_filters:
@@ -380,7 +380,7 @@ class PaiNN(hk.Module):
         """
         # compute atom and pair features
         norm_ij = jnp.sqrt(jnp.sum(graph.edges**2, axis=1, keepdims=True) + self._eps)
-        # edge directions.
+        # edge directions
         # NOTE: assumes edge features are displacement vectors.
         dir_ij = graph.edges / (norm_ij + self._eps)
         graph = graph._replace(edges=dir_ij)
