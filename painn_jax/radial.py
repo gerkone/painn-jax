@@ -9,7 +9,7 @@ def gaussian_rbf(
     cutoff: float,
     start: float = 0.0,
     centered: bool = False,
-    trainable: bool = False,
+    learnable: bool = False,
 ) -> Callable[[jnp.ndarray], Callable]:
     r"""Gaussian radial basis functions.
 
@@ -17,7 +17,7 @@ def gaussian_rbf(
         n_rbf: total number of Gaussian functions, :math:`N_g`.
         cutoff: center of last Gaussian function, :math:`\mu_{N_g}`
         start: center of first Gaussian function, :math:`\mu_0`.
-        trainable: If True, widths and offset of Gaussian functions learnable.
+        learnable: If True, widths and offset of Gaussian functions learnable.
     """
     if centered:
         widths = jnp.linspace(start, cutoff, n_rbf)
@@ -26,9 +26,13 @@ def gaussian_rbf(
         offset = jnp.linspace(start, cutoff, n_rbf)
         width = jnp.abs(cutoff - start) / n_rbf * jnp.ones_like(offset)
 
-    if trainable:
-        widths = hk.get_parameter("widths", width.shape, width.dtype, init=width)
-        offsets = hk.get_parameter("offset", offset.shape, offset.dtype, init=offset)
+    if learnable:
+        widths = hk.get_parameter(
+            "widths", width.shape, width.dtype, init=lambda *_: width
+        )
+        offsets = hk.get_parameter(
+            "offset", offset.shape, offset.dtype, init=lambda *_: offset
+        )
     else:
         hk.set_state("widths", jnp.array([width]))
         hk.set_state("offsets", jnp.array([offset]))
