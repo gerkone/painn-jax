@@ -114,21 +114,21 @@ def setup_nbody_data(
             partition="train",
             dataset_name="small",
             max_samples=3000,
-            neighbours=args.neighbours,
+            neighbours=5,
             target=args.target,
             n_bodies=100,
         )
         dataset_val = GravityDataset(
             partition="val",
             dataset_name="small",
-            neighbours=args.neighbours,
+            neighbours=5,
             target=args.target,
             n_bodies=100,
         )
         dataset_test = GravityDataset(
             partition="test",
             dataset_name="small",
-            neighbours=args.neighbours,
+            neighbours=5,
             target=args.target,
             n_bodies=100,
         )

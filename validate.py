@@ -117,7 +117,7 @@ if __name__ == "__main__":
         args.task = "graph"
         args.node_type = "discrete"
     if args.dataset in ["charged", "gravity"]:
-        args.target = "loc"
+        args.target = "pos"
         args.task = "node"
         args.radius = 1000.0
         args.node_type = "continuous"
@@ -134,20 +134,21 @@ if __name__ == "__main__":
     rbf = radial.EXISTING_RBF.get(args.basis, None)
     cutoff_fn = cutoff.cosine_cutoff
 
-    painn = lambda x: PaiNN(
-        hidden_size=args.units,
-        n_layers=args.layers,
-        max_z=20,
-        node_type=args.node_type,
-        radial_basis_fn=rbf,
-        cutoff_fn=cutoff_fn,
-        task=args.task,
-        pool="sum",
-        radius=args.radius,
-        n_rbf=20,
-        out_channels=1,
-        readout_fn=custom_readout,
-    )(x)
+    def painn(x):
+        return PaiNN(
+            hidden_size=args.units,
+            n_layers=args.layers,
+            max_z=20,
+            node_type=args.node_type,
+            radial_basis_fn=rbf,
+            cutoff_fn=cutoff_fn,
+            task=args.task,
+            pool="sum",
+            radius=args.radius,
+            n_rbf=20,
+            out_channels=1,
+            readout_fn=custom_readout,
+        )(x)
 
     painn = hk.without_apply_rng(hk.transform_with_state(painn))
 
