@@ -24,8 +24,8 @@ This implementation is validated on QM9 on the dipole moment target. The results
 
 |                  |  MSE  | Inference [ms]  |
 |------------------|-------|-----------------|
+| [torch (original)](https://github.com/atomistic-machine-learning/schnetpack/blob/2ed8d1a3b773f4ed2dbd50623d43d578ff0146f6/src/schnetpack/representation/painn.py) | 0.012 |     163.23      |
 | jax (ours)       | 0.014 |      8.42*      |
-| torch (original) | 0.012 |     163.23      |
 
 \* padded (naive)
 
