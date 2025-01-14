@@ -20,8 +20,8 @@ def gaussian_rbf(
         learnable: If True, widths and offset of Gaussian functions learnable.
     """
     if centered:
-        widths = jnp.linspace(start, cutoff, n_rbf)
-        offset = jnp.zeros_like(widths)
+        width = jnp.linspace(start, cutoff, n_rbf)
+        offset = jnp.zeros_like(width)
     else:
         offset = jnp.linspace(start, cutoff, n_rbf)
         width = jnp.abs(cutoff - start) / n_rbf * jnp.ones_like(offset)
